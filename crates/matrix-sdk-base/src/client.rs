@@ -656,6 +656,7 @@ impl BaseClient {
             to_device,
             device_lists,
             device_one_time_keys_count,
+            device_unused_fallback_key_types,
             ..
         } = response;
 
@@ -677,8 +678,13 @@ impl BaseClient {
                 // decrypts to-device events, but leaves room events alone.
                 // This makes sure that we have the decryption keys for the room
                 // events at hand.
-                o.receive_sync_changes(to_device, &device_lists, &device_one_time_keys_count)
-                    .await?
+                o.receive_sync_changes(
+                    to_device,
+                    &device_lists,
+                    &device_one_time_keys_count,
+                    device_unused_fallback_key_types.as_deref(),
+                )
+                .await?
             } else {
                 to_device
             }

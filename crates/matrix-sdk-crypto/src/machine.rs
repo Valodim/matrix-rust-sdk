@@ -562,8 +562,8 @@ impl OlmMachine {
     /// [`receive_keys_upload_response`]: #method.receive_keys_upload_response
     /// [`OlmMachine`]: struct.OlmMachine.html
     async fn keys_for_upload(&self) -> Option<upload_keys::Request> {
-        let (device_keys, one_time_keys) = self.account.keys_for_upload().await?;
-        Some(assign!(upload_keys::Request::new(), { device_keys, one_time_keys }))
+        let (device_keys, one_time_keys, fallback_keys) = self.account.keys_for_upload().await?;
+        Some(assign!(upload_keys::Request::new(), { device_keys, one_time_keys, fallback_keys }))
     }
 
     /// Decrypt a to-device event.
@@ -860,8 +860,12 @@ impl OlmMachine {
         self.verification_machine.get_requests(user_id)
     }
 
-    fn update_one_time_key_count(&self, key_count: &BTreeMap<DeviceKeyAlgorithm, UInt>) {
-        self.account.update_uploaded_key_count(key_count);
+    async fn update_key_counts(
+        &self,
+        one_time_key_count: &BTreeMap<DeviceKeyAlgorithm, UInt>,
+        fallback_key_count: Option<&[DeviceKeyAlgorithm]>,
+    ) {
+        self.account.update_key_counts(one_time_key_count, fallback_key_count).await;
     }
 
     async fn handle_to_device_event(&self, event: &AnyToDeviceEvent) {
@@ -914,6 +918,7 @@ impl OlmMachine {
         to_device_events: ToDevice,
         changed_devices: &DeviceLists,
         one_time_keys_counts: &BTreeMap<DeviceKeyAlgorithm, UInt>,
+        unused_fallback_keys: Option<&[DeviceKeyAlgorithm]>,
     ) -> OlmResult<ToDevice> {
         // Remove verification objects that have expired or are done.
         let mut events = self.verification_machine.garbage_collect();
@@ -923,7 +928,7 @@ impl OlmMachine {
         let mut changes =
             Changes { account: Some(self.account.inner.clone()), ..Default::default() };
 
-        self.update_one_time_key_count(one_time_keys_counts);
+        self.update_key_counts(one_time_keys_counts, unused_fallback_keys).await;
 
         for user_id in &changed_devices.changed {
             if let Err(e) = self.identity_manager.mark_user_as_changed(user_id).await {

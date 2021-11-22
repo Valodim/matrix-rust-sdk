@@ -35,13 +35,9 @@ getrandom = "0.2.3"
 hmac = "0.11.0"
 matrix-qrcode = { version = "0.2.0", path = "../matrix-qrcode", optional = true }
 matrix-sdk-common = { version = "0.4.0", path = "../matrix-sdk-common" }
-olm-rs = { version = "2.1", features = ["serde"] }
+olm-rs = { features = ["serde"], path = "/home/poljar/werk/matrix/olm-rs" }
 pbkdf2 = { version = "0.9.0", default-features = false }
 rand = "0.8.4"
-ruma = { git = "https://github.com/ruma/ruma", rev = "ac6ecc3e5", features = [
-    "client-api-c",
-    "unstable-pre-spec",
-] }
 serde = { version = "1.0.126", features = ["derive", "rc"] }
 serde_json = "1.0.64"
 sha2 = "0.9.5"
@@ -49,6 +45,10 @@ sled = { version = "0.34.6", optional = true }
 thiserror = "1.0.25"
 tracing = "0.1.26"
 zeroize = { version = "1.3.0", features = ["zeroize_derive"] }
+
+[dependencies.ruma]
+path = "/home/poljar/werk/matrix/ruma/crates/ruma"
+features = ["client-api-c", "unstable-pre-spec"]
 
 [dev-dependencies]
 criterion = { version = "0.3.4", features = [

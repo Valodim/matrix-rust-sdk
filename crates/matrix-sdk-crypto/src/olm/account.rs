@@ -25,7 +25,7 @@ use std::{
 
 use matrix_sdk_common::{instant::Instant, locks::Mutex};
 use olm_rs::{
-    account::{IdentityKeys, OlmAccount, OneTimeKeys},
+    account::{IdentityKeys, OlmAccount, OneTimeKeys, FallbackKey},
     errors::{OlmAccountError, OlmSessionError},
     session::{OlmMessage, PreKeyMessage},
     PicklingMode,
@@ -220,8 +220,12 @@ impl Account {
         }
     }
 
-    pub fn update_uploaded_key_count(&self, key_count: &BTreeMap<DeviceKeyAlgorithm, UInt>) {
-        if let Some(count) = key_count.get(&DeviceKeyAlgorithm::SignedCurve25519) {
+    pub async fn update_key_counts(
+        &self,
+        one_time_key_counts: &BTreeMap<DeviceKeyAlgorithm, UInt>,
+        fallback_key_counts: Option<&[DeviceKeyAlgorithm]>,
+    ) {
+        if let Some(count) = one_time_key_counts.get(&DeviceKeyAlgorithm::SignedCurve25519) {
             let count: u64 = (*count).into();
             let old_count = self.inner.uploaded_key_count();
 
@@ -238,6 +242,13 @@ impl Account {
 
             self.inner.update_uploaded_key_count(count);
         }
+
+        if let Some(unused) = fallback_key_counts {
+            if !unused.contains(&DeviceKeyAlgorithm::SignedCurve25519) {
+                // Generate a new fallback key if we don't have one.
+                self.inner.generate_fallback_key_helper().await;
+            }
+        }
     }
 
     pub async fn receive_keys_upload_response(
@@ -249,8 +260,8 @@ impl Account {
         }
         self.inner.mark_as_shared();
 
-        debug!("Marking one-time keys as published");
-        self.update_uploaded_key_count(&response.one_time_key_counts);
+        debug!("Marking one-time keys and fallback key as published");
+        self.update_key_counts(&response.one_time_key_counts, None).await;
         self.inner.mark_keys_as_published().await;
         self.store.save_account(self.inner.clone()).await?;
 
@@ -600,9 +611,26 @@ impl ReadOnlyAccount {
         self.inner.lock().await.parsed_one_time_keys()
     }
 
+    async fn fallback_key(&self) -> Option<FallbackKey> {
+        self.inner.lock().await.parsed_fallback_key()
+    }
+
     /// Generate count number of one-time keys.
     pub(crate) async fn generate_one_time_keys_helper(&self, count: usize) {
         self.inner.lock().await.generate_one_time_keys(count);
+    }
+
+    async fn generate_fallback_key_helper(&self) {
+        let account = self.inner.lock().await;
+
+        if account.parsed_fallback_key().is_none() {
+            debug!(
+                "No unused fallback keys were found on the server, generating \
+                a new fallback key.",
+            );
+
+            account.generate_fallback_key();
+        }
     }
 
     /// Get the maximum number of one-time keys the account can hold.
@@ -639,22 +667,25 @@ impl ReadOnlyAccount {
     /// Should account or one-time keys be uploaded to the server.
     pub(crate) async fn should_upload_keys(&self) -> bool {
         if !self.shared() {
-            return true;
+            true
+        } else if self.fallback_key().await.is_some() {
+            true
+        } else {
+            let count = self.uploaded_key_count();
+
+            // If we have a known key count, check that we have more than
+            // max_one_time_Keys() / 2, otherwise tell the client to upload more.
+            let max_keys = self.max_one_time_keys().await as u64;
+            // If there are more keys already uploaded than max_key / 2
+            // bail out returning false, this also avoids overflow.
+            if count > (max_keys / 2) {
+                return false;
+            }
+
+            let key_count = (max_keys / 2) - count;
+
+            key_count > 0
         }
-
-        let count = self.uploaded_key_count();
-
-        // If we have a known key count, check that we have more than
-        // max_one_time_Keys() / 2, otherwise tell the client to upload more.
-        let max_keys = self.max_one_time_keys().await as u64;
-        // If there are more keys already uploaded than max_key / 2
-        // bail out returning false, this also avoids overflow.
-        if count > (max_keys / 2) {
-            return false;
-        }
-
-        let key_count = (max_keys / 2) - count;
-        key_count > 0
     }
 
     /// Get a tuple of device and one-time keys that need to be uploaded.
@@ -662,16 +693,20 @@ impl ReadOnlyAccount {
     /// Returns None if no keys need to be uploaded.
     pub(crate) async fn keys_for_upload(
         &self,
-    ) -> Option<(Option<DeviceKeys>, Option<BTreeMap<DeviceKeyId, OneTimeKey>>)> {
+    ) -> Option<(
+        Option<DeviceKeys>,
+        Option<BTreeMap<DeviceKeyId, OneTimeKey>>,
+        Option<BTreeMap<DeviceKeyId, OneTimeKey>>,
+    )> {
         if !self.should_upload_keys().await {
             return None;
         }
 
         let device_keys = if !self.shared() { Some(self.device_keys().await) } else { None };
-
         let one_time_keys = self.signed_one_time_keys().await.ok();
+        let fallback_keys = self.signed_fallback_keys().await;
 
-        Some((device_keys, one_time_keys))
+        Some((device_keys, one_time_keys, fallback_keys))
     }
 
     /// Mark the current set of one-time keys as being published.
@@ -848,6 +883,55 @@ impl ReadOnlyAccount {
         self.sign(&canonical_json.to_string()).await
     }
 
+    async fn signed_fallback_keys(&self) -> Option<BTreeMap<DeviceKeyId, OneTimeKey>> {
+        if let Some(fallback_key) = self.fallback_key().await {
+            let mut fallback_key_map = BTreeMap::new();
+            let key_id = fallback_key.index();
+            let key = fallback_key.curve25519();
+
+            let signed_key = self.sign_key(key, true).await;
+
+            fallback_key_map.insert(
+                DeviceKeyId::from_parts(DeviceKeyAlgorithm::SignedCurve25519, key_id.into()),
+                OneTimeKey::SignedKey(signed_key),
+            );
+
+            Some(fallback_key_map)
+        } else {
+            None
+        }
+    }
+
+    async fn sign_key(&self, key: &str, fallback: bool) -> SignedKey {
+        let mut signature_map = BTreeMap::new();
+        let mut signatures = BTreeMap::new();
+
+        let key_json = if fallback {
+            json!({
+                "key": key,
+            })
+        } else {
+            json!({
+                "key": key,
+                "fallback": true,
+            })
+        };
+
+        let signature = self.sign_json(key_json).await;
+
+        signature_map.insert(
+            DeviceKeyId::from_parts(DeviceKeyAlgorithm::Ed25519, &self.device_id),
+            signature,
+        );
+        signatures.insert((*self.user_id).clone(), signature_map);
+
+        if fallback {
+            SignedKey::new_fallback_key(key.to_owned(), signatures)
+        } else {
+            SignedKey::new(key.to_owned(), signatures)
+        }
+    }
+
     pub(crate) async fn signed_one_time_keys_helper(
         &self,
     ) -> Result<BTreeMap<DeviceKeyId, OneTimeKey>, ()> {
@@ -855,23 +939,7 @@ impl ReadOnlyAccount {
         let mut one_time_key_map = BTreeMap::new();
 
         for (key_id, key) in one_time_keys.curve25519().iter() {
-            let key_json = json!({
-                "key": key,
-            });
-
-            let signature = self.sign_json(key_json).await;
-
-            let mut signature_map = BTreeMap::new();
-
-            signature_map.insert(
-                DeviceKeyId::from_parts(DeviceKeyAlgorithm::Ed25519, &self.device_id),
-                signature,
-            );
-
-            let mut signatures = BTreeMap::new();
-            signatures.insert((*self.user_id).clone(), signature_map);
-
-            let signed_key = SignedKey::new(key.to_owned(), signatures);
+            let signed_key = self.sign_key(key, false).await;
 
             one_time_key_map.insert(
                 DeviceKeyId::from_parts(
@@ -1175,13 +1243,13 @@ mod test {
         let one_time_keys = account
             .keys_for_upload()
             .await
-            .and_then(|(_, k)| k)
+            .and_then(|(_, k, _)| k)
             .expect("Initial keys can't be generated");
 
         let second_one_time_keys = account
             .keys_for_upload()
             .await
-            .and_then(|(_, k)| k)
+            .and_then(|(_, k, _)| k)
             .expect("Second round of one-time keys isn't generated");
 
         let device_key_ids: BTreeSet<&DeviceKeyId> = one_time_keys.keys().collect();
@@ -1192,7 +1260,7 @@ mod test {
         account.mark_keys_as_published().await;
         account.update_uploaded_key_count(50);
 
-        let third_one_time_keys = account.keys_for_upload().await.and_then(|(_, k)| k);
+        let third_one_time_keys = account.keys_for_upload().await.and_then(|(_, k, _)| k);
 
         assert!(third_one_time_keys.is_none());
 
@@ -1201,12 +1269,29 @@ mod test {
         let fourth_one_time_keys = account
             .keys_for_upload()
             .await
-            .and_then(|(_, k)| k)
+            .and_then(|(_, k, _)| k)
             .expect("Fourth round of one-time keys isn't generated");
 
         let fourth_device_key_ids: BTreeSet<&DeviceKeyId> = fourth_one_time_keys.keys().collect();
 
         assert_ne!(device_key_ids, fourth_device_key_ids);
+
+        Ok(())
+    }
+
+    #[async_test]
+    async fn fallback_key_creation() -> Result<()> {
+        let account = ReadOnlyAccount::new(&user_id(), &device_id());
+
+        let fallback_keys = account.keys_for_upload().await.and_then(|(_, _, k)| k);
+
+        // We don't create fallback keys since we don't know if the server
+        // supports them, we need to receive a sync response to decide if we're
+        // going to create them or not.
+        assert!(fallback_keys.is_none());
+
+        // TODO test something actually
+        // account.update_key_counts().await;
 
         Ok(())
     }
