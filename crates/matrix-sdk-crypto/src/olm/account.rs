@@ -25,7 +25,7 @@ use std::{
 
 use matrix_sdk_common::{instant::Instant, locks::Mutex};
 use olm_rs::{
-    account::{IdentityKeys, OlmAccount, OneTimeKeys, FallbackKey},
+    account::{FallbackKey, IdentityKeys, OlmAccount, OneTimeKeys},
     errors::{OlmAccountError, OlmSessionError},
     session::{OlmMessage, PreKeyMessage},
     PicklingMode,
@@ -217,37 +217,6 @@ impl Account {
             );
 
             Err(EventError::UnsupportedAlgorithm.into())
-        }
-    }
-
-    pub async fn update_key_counts(
-        &self,
-        one_time_key_counts: &BTreeMap<DeviceKeyAlgorithm, UInt>,
-        fallback_key_counts: Option<&[DeviceKeyAlgorithm]>,
-    ) {
-        if let Some(count) = one_time_key_counts.get(&DeviceKeyAlgorithm::SignedCurve25519) {
-            let count: u64 = (*count).into();
-            let old_count = self.inner.uploaded_key_count();
-
-            // Some servers might always return the key counts in the sync
-            // response, we don't want to the logs with noop changes if they do
-            // so.
-            if count != old_count {
-                debug!(
-                    "Updated uploaded one-time key count {} -> {}.",
-                    self.inner.uploaded_key_count(),
-                    count
-                );
-            }
-
-            self.inner.update_uploaded_key_count(count);
-        }
-
-        if let Some(unused) = fallback_key_counts {
-            if !unused.contains(&DeviceKeyAlgorithm::SignedCurve25519) {
-                // Generate a new fallback key if we don't have one.
-                self.inner.generate_fallback_key_helper().await;
-            }
         }
     }
 
@@ -562,6 +531,37 @@ impl ReadOnlyAccount {
         }
     }
 
+    pub(crate) async fn update_key_counts(
+        &self,
+        one_time_key_counts: &BTreeMap<DeviceKeyAlgorithm, UInt>,
+        fallback_key_counts: Option<&[DeviceKeyAlgorithm]>,
+    ) {
+        if let Some(count) = one_time_key_counts.get(&DeviceKeyAlgorithm::SignedCurve25519) {
+            let count: u64 = (*count).into();
+            let old_count = self.uploaded_key_count();
+
+            // Some servers might always return the key counts in the sync
+            // response, we don't want to the logs with noop changes if they do
+            // so.
+            if count != old_count {
+                debug!(
+                    "Updated uploaded one-time key count {} -> {}.",
+                    self.uploaded_key_count(),
+                    count
+                );
+            }
+
+            self.update_uploaded_key_count(count);
+        }
+
+        if let Some(unused) = fallback_key_counts {
+            if !unused.contains(&DeviceKeyAlgorithm::SignedCurve25519) {
+                // Generate a new fallback key if we don't have one.
+                self.generate_fallback_key_helper().await;
+            }
+        }
+    }
+
     /// Get the user id of the owner of the account.
     pub fn user_id(&self) -> &UserId {
         &self.user_id
@@ -666,9 +666,7 @@ impl ReadOnlyAccount {
 
     /// Should account or one-time keys be uploaded to the server.
     pub(crate) async fn should_upload_keys(&self) -> bool {
-        if !self.shared() {
-            true
-        } else if self.fallback_key().await.is_some() {
+        if !self.shared() || self.fallback_key().await.is_some() {
             true
         } else {
             let count = self.uploaded_key_count();
@@ -909,11 +907,11 @@ impl ReadOnlyAccount {
         let key_json = if fallback {
             json!({
                 "key": key,
+                "fallback": true,
             })
         } else {
             json!({
                 "key": key,
-                "fallback": true,
             })
         };
 
@@ -1220,10 +1218,10 @@ impl PartialEq for ReadOnlyAccount {
 
 #[cfg(test)]
 mod test {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use matrix_sdk_test::async_test;
-    use ruma::{identifiers::DeviceIdBox, user_id, DeviceKeyId, UserId};
+    use ruma::{identifiers::DeviceIdBox, user_id, DeviceKeyAlgorithm, DeviceKeyId, UserId};
 
     use super::ReadOnlyAccount;
     use crate::error::OlmResult as Result;
@@ -1290,8 +1288,28 @@ mod test {
         // going to create them or not.
         assert!(fallback_keys.is_none());
 
-        // TODO test something actually
-        // account.update_key_counts().await;
+        let one_time_keys = BTreeMap::from([(DeviceKeyAlgorithm::SignedCurve25519, 50u8.into())]);
+
+        // A `None` here means that the server doesn't support fallback keys, no
+        // fallback key gets uploaded.
+        account.update_key_counts(&one_time_keys, None).await;
+        let fallback_keys = account.keys_for_upload().await.and_then(|(_, _, k)| k);
+        assert!(fallback_keys.is_none());
+
+        // The empty array means that the server supports fallback keys but
+        // there isn't a unused fallback key on the server. This time we upload
+        // a fallback key.
+        let unused_fallback_keys = &[];
+        account.update_key_counts(&one_time_keys, Some(unused_fallback_keys.as_ref())).await;
+        let fallback_keys = account.keys_for_upload().await.and_then(|(_, _, k)| k);
+        assert!(fallback_keys.is_some());
+        account.mark_keys_as_published().await;
+
+        // There's an unused fallback key on the server, nothing to do here.
+        let unused_fallback_keys = &[DeviceKeyAlgorithm::SignedCurve25519];
+        account.update_key_counts(&one_time_keys, Some(unused_fallback_keys.as_ref())).await;
+        let fallback_keys = account.keys_for_upload().await.and_then(|(_, _, k)| k);
+        assert!(fallback_keys.is_none());
 
         Ok(())
     }
